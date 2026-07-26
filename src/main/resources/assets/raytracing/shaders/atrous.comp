@@ -1,0 +1,68 @@
+// atrous.comp — edge-avoiding à-trous wavelet iteration (SVGF, docs/05 §7).
+// pc.x = step size (1, 2, 4, …); pc.y = 1 → also write SVGF feedback tap into accum.
+// Image bindings:
+//   0 imgNormal   r   (normal + hitT)
+//   1 imgIn       r   (rgb color, a variance)
+//   2 imgOut      w
+//   3 imgAccumFeedback rw (iteration 0 writes its result back as next frame's history)
+#include "common.glsl"
+
+IMG(0, rgba16f) uniform readonly image2D imgNormal;
+IMG(1, rgba16f) uniform readonly image2D imgIn;
+IMG(2, rgba16f) uniform writeonly image2D imgOut;
+IMG(3, rgba16f) uniform image2D imgAccumFeedback;
+
+PUSH_CONSTANTS
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float KW[3] = float[3](0.375, 0.25, 0.0625);
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= g.rtOut.x || px.y >= g.rtOut.y) return;
+
+    vec4 c = imageLoad(imgIn, px);
+    vec4 nd = imageLoad(imgNormal, px);
+    if (nd.w < 0.0) {
+        imageStore(imgOut, px, c);
+        return;
+    }
+
+    int stepSize = pc.x;
+    float lc = luminance(c.rgb);
+    float sigmaL = 4.0 * sqrt(c.a + 1e-6) + 1e-3;
+    float sigmaZ = 0.06 * max(nd.w, 1.0) * float(stepSize) + 0.02;
+
+    float wCenter = KW[0] * KW[0];
+    vec3 sum = c.rgb * wCenter;
+    float varSum = c.a * wCenter * wCenter;
+    float wSum = wCenter;
+
+    for (int dy = -2; dy <= 2; dy++)
+    for (int dx = -2; dx <= 2; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        ivec2 q = px + ivec2(dx, dy) * stepSize;
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, g.rtOut.xy))) continue;
+        vec4 snd = imageLoad(imgNormal, q);
+        if (snd.w < 0.0) continue;
+        vec4 s = imageLoad(imgIn, q);
+        float wz = exp(-abs(snd.w - nd.w) / sigmaZ);
+        float wn = pow(max(dot(snd.xyz, nd.xyz), 0.0), 128.0);
+        float wl = exp(-abs(luminance(s.rgb) - lc) / sigmaL);
+        float k = KW[abs(dx)] * KW[abs(dy)];
+        float w = wz * wn * wl * k;
+        sum += s.rgb * w;
+        varSum += s.a * w * w;
+        wSum += w;
+    }
+
+    vec3 outC = sum / wSum;
+    float outVar = varSum / (wSum * wSum);
+    imageStore(imgOut, px, vec4(outC, outVar));
+
+    if (pc.y == 1) { // SVGF feedback: filtered iter-1 becomes next frame's color history
+        float hist = imageLoad(imgAccumFeedback, px).a;
+        imageStore(imgAccumFeedback, px, vec4(outC, hist));
+    }
+}

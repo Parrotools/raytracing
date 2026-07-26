@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "raytracing",
+  "version": "${version}",
+  "name": "Raytracing",
+  "description": "Real-time path tracing renderer for Minecraft: voxel DDA acceleration structure, PBR materials, SVGF denoising — on both the OpenGL and Vulkan backends of Minecraft 26.2.",
+  "authors": [
+    "Parrotools"
+  ],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "icon": "assets/raytracing/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "fabric-datagen": [
+      "org.mining.raytracing.client.RaytracingDataGenerator"
+    ],
+    "client": [
+      "org.mining.raytracing.client.RaytracingClient"
+    ],
+    "main": [
+      "org.mining.raytracing.Raytracing"
+    ]
+  },
+  "mixins": [
+    "raytracing.mixins.json",
+    {
+      "config": "raytracing.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "${minecraft_version}"
+  }
+}

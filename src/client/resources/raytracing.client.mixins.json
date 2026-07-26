@@ -1,0 +1,23 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "org.mining.raytracing.mixin.client",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ClientChunkCacheMixin",
+    "ClientLevelMixin",
+    "CreateWorldScreenInvoker",
+    "CreateWorldScreenMixin",
+    "GlBackendMixin",
+    "GpuDeviceAccessor",
+    "LevelRendererMixin",
+    "MinecraftMixin",
+    "WorldOpenFlowsMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "overwrites": {
+    "requireAnnotations": true
+  }
+}

@@ -1,0 +1,96 @@
+// temporal.comp — SVGF-style temporal accumulation (docs/05 §6).
+// Image bindings (must match backend binding plan):
+//   0 imgIrradiance r  (this frame's demodulated radiance)
+//   1 imgNormal     r  (current normal + hitT)
+//   2 imgPrevNormal r  (previous frame)
+//   3 imgAccumIn    r  (rgb accum, a history length)
+//   4 imgAccumOut   w
+//   5 imgMomentsIn  r  (luminance μ1, μ2)
+//   6 imgMomentsOut w
+//   7 imgAtrousOut  w  (rgb integrated color, a variance) — à-trous input
+#include "common.glsl"
+
+IMG(0, rgba16f) uniform readonly  image2D imgIrradiance;
+IMG(1, rgba16f) uniform readonly  image2D imgNormal;
+IMG(2, rgba16f) uniform readonly  image2D imgPrevNormal;
+IMG(3, rgba16f) uniform readonly  image2D imgAccumIn;
+IMG(4, rgba16f) uniform writeonly image2D imgAccumOut;
+IMG(5, rg16f)   uniform readonly  image2D imgMomentsIn;
+IMG(6, rg16f)   uniform writeonly image2D imgMomentsOut;
+IMG(7, rgba16f) uniform writeonly image2D imgAtrousOut;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= g.rtOut.x || px.y >= g.rtOut.y) return;
+
+    vec4 nd = imageLoad(imgNormal, px);
+    vec3 irr = imageLoad(imgIrradiance, px).rgb;
+
+    if (nd.w < 0.0) { // sky: nothing to accumulate or denoise
+        imageStore(imgAccumOut, px, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(imgMomentsOut, px, vec4(0.0));
+        imageStore(imgAtrousOut, px, vec4(0.0));
+        return;
+    }
+
+    // reconstruct the surface point along the (unjittered) center ray
+    vec2 ndc = ((vec2(px) + 0.5) / vec2(g.rtOut.xy)) * 2.0 - 1.0;
+    vec3 rd = primaryRayDir(ndc);
+    vec3 P = g.camPos.xyz + rd * nd.w;
+
+    bool reset = (g.counts.w & 1) != 0;
+    vec3 histC = vec3(0.0);
+    vec2 histM = vec2(0.0);
+    float histLen = 0.0, wSum = 0.0;
+
+    if (!reset) {
+        vec4 clip = g.prevViewProj * vec4(P, 1.0);
+        if (clip.w > 1e-4) {
+            vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+            if (all(greaterThanEqual(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
+                float expectedT = distance(P, g.prevCamPos.xyz);
+                vec2 fpx = prevUv * vec2(g.rtOut.xy) - 0.5;
+                ivec2 ip = ivec2(floor(fpx));
+                vec2 fr = fpx - vec2(ip);
+                for (int j = 0; j <= 1; j++)
+                for (int i = 0; i <= 1; i++) {
+                    ivec2 q = ip + ivec2(i, j);
+                    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, g.rtOut.xy))) continue;
+                    vec4 pnd = imageLoad(imgPrevNormal, q);
+                    if (pnd.w < 0.0) continue;
+                    if (dot(pnd.xyz, nd.xyz) < 0.8) continue;
+                    if (abs(pnd.w - expectedT) > 0.1 * max(expectedT, 1.0)) continue;
+                    float w = (i == 0 ? 1.0 - fr.x : fr.x) * (j == 0 ? 1.0 - fr.y : fr.y);
+                    histC += imageLoad(imgAccumIn, q).rgb * w;
+                    histM += imageLoad(imgMomentsIn, q).xy * w;
+                    histLen += imageLoad(imgAccumIn, q).a * w;
+                    wSum += w;
+                }
+            }
+        }
+    }
+
+    float lum = luminance(irr);
+    vec3 outC;
+    vec2 outM;
+    float h;
+    if (wSum > 1e-3) {
+        histC /= wSum; histM /= wSum; histLen /= wSum;
+        h = min(histLen + 1.0, float(g.frameParams.w));
+        float alpha = max(g.tuning.x, 1.0 / h);
+        outC = mix(histC, irr, alpha);
+        outM = mix(histM, vec2(lum, lum * lum), max(alpha, 0.2));
+    } else {
+        h = 1.0;
+        outC = irr;
+        outM = vec2(lum, lum * lum);
+    }
+    float variance = max(outM.y - outM.x * outM.x, 0.0);
+    if (h < 4.0) variance = max(variance, 0.5); // young history → force spatial filtering
+
+    imageStore(imgAccumOut, px, vec4(outC, h));
+    imageStore(imgMomentsOut, px, vec4(outM, 0.0, 0.0));
+    imageStore(imgAtrousOut, px, vec4(outC, variance));
+}

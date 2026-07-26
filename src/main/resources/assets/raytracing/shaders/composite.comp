@@ -1,0 +1,67 @@
+// composite.comp — albedo remodulation, tonemap, render-scale upscale, debug views.
+// Runs at DISPLAY resolution (rtOut.zw). Image bindings:
+//   0 imgResult   r (rgba16f, denoised irradiance at rt res)
+//   1 imgAlbedo   r (rgba8, rt res)
+//   2 imgEmission r (rgba16f, rt res)
+//   3 imgNormal   r (rgba16f, rt res — debug views)
+//   4 imgOutput   w (rgba8, display res)
+#include "common.glsl"
+
+IMG(0, rgba16f) uniform readonly image2D imgResult;
+IMG(1, rgba8)   uniform readonly image2D imgAlbedo;
+IMG(2, rgba16f) uniform readonly image2D imgEmission;
+IMG(3, rgba16f) uniform readonly image2D imgNormal;
+IMG(4, rgba8)   uniform writeonly image2D imgOutput;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// manual bilinear over imageLoad (no samplers in the pipeline — docs/02 §3.3)
+vec3 loadBilinear(vec2 p, ivec2 bound, int which) {
+    ivec2 ip = ivec2(floor(p));
+    vec2 fr = p - vec2(ip);
+    vec3 acc = vec3(0.0);
+    float wSum = 0.0;
+    for (int j = 0; j <= 1; j++)
+    for (int i = 0; i <= 1; i++) {
+        ivec2 q = clamp(ip + ivec2(i, j), ivec2(0), bound - 1);
+        float w = (i == 0 ? 1.0 - fr.x : fr.x) * (j == 0 ? 1.0 - fr.y : fr.y);
+        vec3 v = which == 0 ? imageLoad(imgResult, q).rgb : imageLoad(imgEmission, q).rgb;
+        acc += v * w;
+        wSum += w;
+    }
+    return acc / max(wSum, 1e-5);
+}
+
+vec3 acesTonemap(vec3 x) {
+    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= g.rtOut.z || px.y >= g.rtOut.w) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(g.rtOut.zw);
+    vec2 rtP = uv * vec2(g.rtOut.xy) - 0.5;
+    ivec2 rtPx = clamp(ivec2(round(rtP)), ivec2(0), g.rtOut.xy - 1); // nearest: keeps voxel edges crisp
+
+    vec3 irr = loadBilinear(rtP, g.rtOut.xy, 0);
+    vec3 emi = loadBilinear(rtP, g.rtOut.xy, 1);
+    vec4 alb = imageLoad(imgAlbedo, rtPx);
+    vec4 nd = imageLoad(imgNormal, rtPx);
+
+    vec3 col = irr * max(alb.rgb, vec3(0.02)) + emi;
+
+    int dbg = g.frameParams.z;
+    if (dbg == 1) col = alb.rgb;
+    else if (dbg == 2) col = nd.w < 0.0 ? vec3(0.0) : nd.xyz * 0.5 + 0.5;
+    else if (dbg == 3) col = vec3(nd.w < 0.0 ? 0.0 : exp(-nd.w * 0.02));
+    else if (dbg == 4) col = irr;
+
+    if (dbg == 0 || dbg == 4) {
+        col *= g.tuning.z;         // exposure
+        col = acesTonemap(col);
+    }
+    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)); // sRGB-ish encode
+
+    imageStore(imgOutput, px, vec4(col, 1.0));
+}

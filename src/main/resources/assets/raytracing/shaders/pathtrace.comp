@@ -1,0 +1,194 @@
+// pathtrace.comp — primary rays + NEE direct light + BRDF-sampled bounces.
+// Image bindings (order matters — must match backend binding plan):
+//   0 imgAlbedo   rgba8  w   (rgb albedo, a roughness)
+//   1 imgNormal   rgba16f w  (xyz normal, w hitT; -1 = sky)
+//   2 imgEmission rgba16f w  (first-hit emission + sky radiance, not denoised)
+//   3 imgIrradiance rgba16f w (albedo-demodulated path radiance)
+#include "common.glsl"
+#include "world.glsl"
+#include "brdf.glsl"
+#include "sky.glsl"
+
+IMG(0, rgba8)   uniform writeonly image2D imgAlbedo;
+IMG(1, rgba16f) uniform writeonly image2D imgNormal;
+IMG(2, rgba16f) uniform writeonly image2D imgEmission;
+IMG(3, rgba16f) uniform writeonly image2D imgIrradiance;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+Mat entityMat(vec3 color) {
+    Mat m;
+    m.albedo = color; m.rough = 0.8;
+    m.emission = vec3(0.0); m.metal = 0.0;
+    m.ior = 1.0; m.trans = 0.0; m.flags = 0u; m.sss = 0.0;
+    return m;
+}
+
+float maxc(vec3 v) { return max(v.x, max(v.y, v.z)); }
+
+// wrap diffuse for SSS-flagged materials (leaves, snow): docs/06
+float wrapNdotL(float nol, float w) {
+    return clamp((nol + w) / (1.0 + w), 0.0, 1.0);
+}
+
+void addDirectLight(vec3 P, vec3 N, vec3 wo, Mat m, vec3 beta, inout vec3 irr, inout uint rng) {
+    // sun / moon
+    vec3 sunDir = g.sunDirCos.xyz;
+    bool day = sunDir.y > -0.05;
+    vec3 lightDir = day ? sunDir : -sunDir;
+    vec3 lightRad = day ? g.sunRadRain.xyz
+                        : vec3(0.045, 0.05, 0.07) * (1.0 - 0.9 * g.sunRadRain.w);
+    if (lightDir.y > 0.0) {
+        vec3 sdir = coneSample(lightDir, g.sunDirCos.w, rng);
+        float nol = dot(N, sdir);
+        if ((m.flags & MF_SSS) != 0u) nol = wrapNdotL(nol, m.sss);
+        if (nol > 0.0 && sdir.y > 0.0) {
+            vec3 vis = traceShadow(P, sdir, 400.0);
+            if (maxc(vis) > 0.0) {
+                vec3 f = brdfEval(m.albedo, m.rough, m.metal, N, wo, sdir);
+                irr += beta * f * nol * lightRad * vis;
+            }
+        }
+    }
+    // emissive blocks
+    vec3 lp, lc; float invPdf;
+    if (pickLight(P, rng, lp, lc, invPdf)) {
+        vec3 ld = lp - P;
+        float d2 = max(dot(ld, ld), 0.25);
+        float dist = sqrt(d2);
+        ld /= dist;
+        float nol = dot(N, ld);
+        // fade before the 3³-section candidate radius so the discrete set change
+        // never shows as a hard boundary on the ground (docs/07)
+        float fade = 1.0 - smoothstep(14.0, 22.0, dist);
+        if (nol > 0.0 && fade > 0.0) {
+            vec3 vis = traceShadow(P, ld, dist - 0.6);
+            if (maxc(vis) > 0.0) {
+                vec3 f = brdfEval(m.albedo, m.rough, m.metal, N, wo, ld);
+                irr += beta * f * nol * lc * (0.35 * fade * invPdf / d2) * vis;
+            }
+        }
+    }
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= g.rtOut.x || px.y >= g.rtOut.y) return;
+    uint rng = rngInit(uvec2(px), uint(g.frameParams.x));
+
+    vec2 jitter = vec2(rnd(rng), rnd(rng)) - 0.5;
+    vec2 ndc = ((vec2(px) + 0.5 + jitter) / vec2(g.rtOut.xy)) * 2.0 - 1.0;
+    vec3 ro = g.camPos.xyz;
+    vec3 rd = primaryRayDir(ndc);
+
+    HitInfo h;
+    bool voxHit = traceScene(ro, rd, 600.0, 0u, h);
+    float tBest = voxHit ? h.t : 600.0;
+    vec3 entN, entC;
+    int ent = intersectEntities(ro, rd, tBest, entN, entC);
+
+    if (!voxHit && ent < 0) {
+        imageStore(imgAlbedo, px, vec4(1.0));
+        imageStore(imgNormal, px, vec4(0.0, 0.0, 0.0, -1.0));
+        imageStore(imgEmission, px, vec4(skyRadiance(rd, true), 0.0));
+        imageStore(imgIrradiance, px, vec4(0.0));
+        return;
+    }
+
+    vec3 N; Mat m; uint lastVoxMat = 0u;
+    float t = tBest;
+    if (ent >= 0) { N = entN; m = entityMat(entC); }
+    else { N = h.n; m = loadMat(h.mat); lastVoxMat = h.mat; }
+
+    vec3 firstAlbedo = max(m.albedo, vec3(0.02));
+    imageStore(imgAlbedo, px, vec4(m.albedo, m.rough));
+    imageStore(imgNormal, px, vec4(N, t));
+    imageStore(imgEmission, px, vec4(m.emission, 0.0));
+
+    vec3 irr = vec3(0.0);
+    vec3 beta = vec3(1.0);
+    vec3 Praw = ro + rd * t;
+    vec3 P = Praw + N * RAY_EPS;
+    vec3 curRd = rd, wo = -rd, curN = N;
+    Mat curM = m;
+    bool specChain = false;
+
+    for (int bounce = 0; bounce <= g.frameParams.y; bounce++) {
+        bool neeOk = curM.trans < 0.5 && !(curM.metal > 0.5 && curM.rough < 0.15);
+        if (neeOk) addDirectLight(P, curN, wo, curM, beta, irr, rng);
+        if (bounce == g.frameParams.y) break;
+
+        // continuation direction
+        vec3 newDir, w;
+        bool goingInside = false;
+        if (curM.trans > 0.01) {
+            float cosI = clamp(dot(wo, curN), 0.0, 1.0);
+            float f0s = pow((curM.ior - 1.0) / (curM.ior + 1.0), 2.0);
+            float F = f0s + (1.0 - f0s) * pow(1.0 - cosI, 5.0);
+            if (rnd(rng) < F) {
+                newDir = reflect(curRd, curN);
+                w = vec3(1.0);
+            } else {
+                vec3 refr = refract(curRd, curN, 1.0 / curM.ior);
+                if (dot(refr, refr) < 1e-6) {
+                    newDir = reflect(curRd, curN);
+                    w = vec3(1.0);
+                } else {
+                    newDir = normalize(refr);
+                    w = mix(vec3(1.0), curM.albedo, 0.7);
+                    goingInside = true;
+                }
+            }
+            specChain = true;
+        } else {
+            vec3 f0 = mix(vec3(0.04), curM.albedo, curM.metal);
+            float pSpec = clamp(luminance(fresnelSchlick(f0, clamp(dot(curN, wo), 0.0, 1.0))), 0.05, 0.9);
+            if (curM.metal > 0.9) pSpec = 1.0;
+            if (rnd(rng) < pSpec) {
+                newDir = sampleSpecular(curN, wo, curM.albedo, curM.rough, curM.metal, w, rng);
+                w /= pSpec;
+                specChain = specChain || curM.rough < 0.3;
+            } else {
+                newDir = cosineSample(curN, rng);
+                w = curM.albedo * (1.0 - curM.metal) / (1.0 - pSpec);
+                specChain = false;
+            }
+        }
+        beta *= w;
+        if (maxc(beta) < 1e-4) break;
+        if (bounce >= 1) { // Russian roulette
+            float q = clamp(maxc(beta), 0.05, 0.95);
+            if (rnd(rng) > q) break;
+            beta /= q;
+        }
+
+        vec3 org = goingInside ? (Praw + newDir * (2.0 * RAY_EPS)) : (Praw + curN * RAY_EPS);
+        uint skip = goingInside ? lastVoxMat : 0u;
+        HitInfo h2;
+        bool vh = traceScene(org, newDir, 300.0, skip, h2);
+        float t2 = vh ? h2.t : 300.0;
+        vec3 n2, c2;
+        int e2 = intersectEntities(org, newDir, t2, n2, c2);
+        if (!vh && e2 < 0) {
+            irr += beta * skyRadiance(newDir, specChain);
+            break;
+        }
+        Mat m2;
+        if (e2 >= 0) { m2 = entityMat(c2); curN = n2; }
+        else { m2 = loadMat(h2.mat); curN = h2.n; lastVoxMat = h2.mat; }
+        // bounce emission pickup (docs/05 §2): full on specular chains & fluids,
+        // reduced for NEE-listed emitters to limit double counting
+        if (maxc(m2.emission) > 0.0) {
+            float wEm = (specChain || (m2.flags & MF_FLUID) != 0u) ? 1.0 : 0.25;
+            irr += beta * m2.emission * wEm;
+        }
+        Praw = org + newDir * t2;
+        P = Praw + curN * RAY_EPS;
+        curM = m2;
+        wo = -newDir;
+        curRd = newDir;
+    }
+
+    irr = min(irr, vec3(g.tuning.y)); // firefly clamp
+    imageStore(imgIrradiance, px, vec4(irr / firstAlbedo, t));
+}
